@@ -29,9 +29,6 @@ in order of most to least important:
 1. Test case generation.
 2. Test case reduction ("shrinking")
 3. A small library of primitive possibilities (generators) and combinators.
-4. A Test case database for replay between runs.
-5. Targeted property-based testing
-6. A caching layer for mapping choice sequences to outcomes
 
 
 Anything that supports 1 and 2 is a reasonable good first porting
@@ -39,17 +36,6 @@ goal. You'll probably want to port most of the possibilities library
 because it's easy and it helps you write tests, but don't worry
 too much about the specifics.
 
-The test case database is *very* useful and I strongly encourage
-you to support it, but if it's fiddly feel free to leave it out
-of a first pass.
-
-Targeted property-based testing is very much a nice to have. You
-probably don't need it, but it's a rare enough feature that supporting
-it gives you bragging rights and who doesn't love bragging rights?
-
-The caching layer you can skip. It's used more heavily in Hypothesis
-proper, but in minithesis you only really need it for shrinking
-performance, so it's mostly a nice to have.
 """
 
 from __future__ import annotations
@@ -82,24 +68,11 @@ T = TypeVar("T", covariant=True)
 S = TypeVar("S", covariant=True)
 U = TypeVar("U")  # Invariant
 
-
-class Database(Protocol):
-    def __setitem__(self, key: str, value: bytes) -> None:
-        ...
-
-    def get(self, key: str) -> Optional[bytes]:
-        ...
-
-    def __delitem__(self, key: str) -> None:
-        ...
-
-
-def run_test(
+def run_test(test: Callable[[TestCase],None],
     max_examples: int = 100,
     random: Optional[Random] = None,
-    database: Optional[Database] = None,
     quiet: bool = False,
-) -> Callable[[Callable[[TestCase], None]], None]:
+) -> None:
     """Decorator to run a test. Usage is:
 
     .. code-block: python
@@ -127,58 +100,30 @@ def run_test(
       cases than this.
     * random: An instance of random.Random that will be used for all
       nondeterministic choices.
-    * database: A dict-like object in which results will be cached and resumed
-      from, ensuring that if a test is run twice it fails in the same way.
     * quiet: Will not print anything on failure if True.
     """
 
-    def accept(test: Callable[[TestCase], None]) -> None:
-        def mark_failures_interesting(test_case: TestCase) -> None:
-            try:
-                test(test_case)
-            except Exception:
-                if test_case.status is not None:
-                    raise
-                test_case.mark_status(Status.INTERESTING)
+    def mark_failures_interesting(test_case: TestCase) -> None:
+        try:
+            test(test_case)
+        except Exception:
+            if test_case.status is not None:
+                raise
+            test_case.mark_status(Status.INTERESTING)
 
-        state = TestingState(
-            random or Random(), mark_failures_interesting, max_examples
-        )
+    state = TestingState(
+        random or Random(), mark_failures_interesting, max_examples
+    )
 
-        if database is None:
-            # If the database is not set, use a standard cache directory
-            # location to persist examples.
-            db: Database = DirectoryDB(".minithesis-cache")
-        else:
-            db = database
+    if state.result is None:
+        state.run()
 
-        previous_failure = db.get(test.__name__)
+    if state.valid_test_cases == 0:
+        raise Unsatisfiable()
 
-        if previous_failure is not None:
-            choices = [
-                int.from_bytes(previous_failure[i : i + 8], "big")
-                for i in range(0, len(previous_failure), 8)
-            ]
-            state.test_function(TestCase.for_choices(choices))
+    if state.result is not None:
+        test(TestCase.for_choices(state.result, print_results=not quiet))
 
-        if state.result is None:
-            state.run()
-
-        if state.valid_test_cases == 0:
-            raise Unsatisfiable()
-
-        if state.result is None:
-            try:
-                del db[test.__name__]
-            except KeyError:
-                pass
-        else:
-            db[test.__name__] = b"".join(i.to_bytes(8, "big") for i in state.result)
-
-        if state.result is not None:
-            test(TestCase.for_choices(state.result, print_results=not quiet))
-
-    return accept
 
 
 class TestCase(object):
@@ -215,7 +160,6 @@ class TestCase(object):
         self.status: Optional[Status] = None
         self.print_results = print_results
         self.depth = 0
-        self.targeting_score: Optional[int] = None
 
     def choice(self, n: int) -> int:
         """Returns a number in the range [0, n]"""
@@ -259,17 +203,6 @@ class TestCase(object):
         mark this test case as invalid."""
         if not precondition:
             self.reject()
-
-    def target(self, score: int) -> None:
-        """Set a score to maximize. Multiple calls to this function
-        will override previous ones.
-
-        The name and idea come from Löscher, Andreas, and Konstantinos
-        Sagonas. "Targeted property-based testing." ISSTA. 2017, but
-        the implementation is based on that found in Hypothesis,
-        which is not that similar to anything described in the paper.
-        """
-        self.targeting_score = score
 
     def any(self, possibility: Possibility[U]) -> U:
         """Return a possible value from ``possibility``."""
@@ -438,71 +371,6 @@ def sort_key(choices: Sequence[int]) -> Tuple[int, Sequence[int]]:
     return (len(choices), choices)
 
 
-class CachedTestFunction(object):
-    """Returns a cached version of a function that maps
-    a choice sequence to the status of calling a test function
-    on a test case populated with it. Is able to take advantage
-    of the structure of the test function to predict the result
-    even if exact sequence of choices has not been seen
-    previously.
-
-    You can safely omit implementing this at the cost of
-    somewhat increased shrinking time.
-    """
-
-    def __init__(self, test_function: Callable[[TestCase], None]):
-        self.test_function = test_function
-
-        # Tree nodes are either a point at which a choice occurs
-        # in which case they map the result of the choice to the
-        # tree node we are in after, or a Status object indicating
-        # mark_status was called at this point and all future
-        # choices are irrelevant.
-        #
-        # Note that a better implementation of this would use
-        # a Patricia trie, which implements long non-branching
-        # paths as an array inline. For simplicity we don't
-        # do that here.
-        # XXX The type of self.tree is recursive
-        self.tree: Dict[int, Union[Status, Dict[int, Any]]] = {}
-
-    def __call__(self, choices: Sequence[int]) -> Status:
-        # XXX The type of node is problematic
-        node: Any = self.tree
-        try:
-            for c in choices:
-                node = node[c]
-                # mark_status was called, thus future choices
-                # will be ignored.
-                if isinstance(node, Status):
-                    assert node != Status.OVERRUN
-                    return node
-            # If we never entered an unknown region of the tree
-            # or hit a Status value, then we know that another
-            # choice will be made next and the result will overrun.
-            return Status.OVERRUN
-        except KeyError:
-            pass
-
-        # We now have to actually call the test function to find out
-        # what happens.
-        test_case = TestCase.for_choices(choices)
-        self.test_function(test_case)
-        assert test_case.status is not None
-
-        # We enter the choices made in a tree.
-        node = self.tree
-        for i, c in enumerate(test_case.choices):
-            if i + 1 < len(test_case.choices) or test_case.status == Status.OVERRUN:
-                try:
-                    node = node[c]
-                except KeyError:
-                    node = node.setdefault(c, {})
-            else:
-                node[c] = test_case.status
-        return test_case.status
-
-
 class TestingState(object):
     def __init__(
         self,
@@ -532,69 +400,14 @@ class TestingState(object):
         if test_case.status >= Status.VALID:
             self.valid_test_cases += 1
 
-            if test_case.targeting_score is not None:
-                relevant_info = (test_case.targeting_score, test_case.choices)
-                if self.best_scoring is None:
-                    self.best_scoring = relevant_info
-                else:
-                    best, _ = self.best_scoring
-                    if test_case.targeting_score > best:
-                        self.best_scoring = relevant_info
-
         if test_case.status == Status.INTERESTING and (
             self.result is None or sort_key(test_case.choices) < sort_key(self.result)
         ):
             self.result = test_case.choices
 
-    def target(self) -> None:
-        """If any test cases have had ``target()`` called on them, do a simple
-        hill climbing algorithm to attempt to optimise that target score."""
-        if self.result is not None or self.best_scoring is None:
-            return
-
-        def adjust(i: int, step: int) -> bool:
-            """Can we improve the score by changing choices[i] by ``step``?"""
-            assert self.best_scoring is not None
-            score, choices = self.best_scoring
-            if choices[i] + step < 0 or choices[i].bit_length() >= 64:
-                return False
-            attempt = array("Q", choices)
-            attempt[i] += step
-            test_case = TestCase(
-                prefix=attempt, random=self.random, max_size=BUFFER_SIZE
-            )
-            self.test_function(test_case)
-            assert test_case.status is not None
-            return (
-                test_case.status >= Status.VALID
-                and test_case.targeting_score is not None
-                and test_case.targeting_score > score
-            )
-
-        while self.should_keep_generating():
-            i = self.random.randrange(0, len(self.best_scoring[1]))
-            sign = 0
-            for k in [1, -1]:
-                if not self.should_keep_generating():
-                    return
-                if adjust(i, k):
-                    sign = k
-                    break
-            if sign == 0:
-                continue
-
-            k = 1
-            while self.should_keep_generating() and adjust(i, sign * k):
-                k *= 2
-
-            while k > 0:
-                while self.should_keep_generating() and adjust(i, sign * k):
-                    pass
-                k //= 2
 
     def run(self) -> None:
         self.generate()
-        self.target()
         self.shrink()
 
     def should_keep_generating(self) -> bool:
@@ -638,12 +451,15 @@ class TestingState(object):
         # us to catch cases where we try something that is e.g. a prefix
         # of something we've previously tried, which is guaranteed
         # not to work.
-        cached = CachedTestFunction(self.test_function)
+        
 
         def consider(choices: array[int]) -> bool:
             if choices == self.result:
                 return True
-            return cached(choices) == Status.INTERESTING
+            test_case = TestCase.for_choices(choices)
+            self.test_function(test_case)
+            assert test_case.status is not None
+            return test_case.status == Status.INTERESTING
 
         assert consider(self.result)
 
@@ -830,42 +646,6 @@ def bin_search_down(lo: int, hi: int, f: Callable[[int], bool]) -> int:
         else:
             lo = mid
     return hi
-
-
-class DirectoryDB:
-    """A very basic key/value store that just uses a file system
-    directory to store values. You absolutely don't have to copy this
-    and should feel free to use a more reasonable key/value store
-    if you have easy access to one."""
-
-    def __init__(self, directory: str):
-        self.directory = directory
-        try:
-            os.mkdir(directory)
-        except FileExistsError:
-            pass
-
-    def __to_file(self, key: str) -> str:
-        return os.path.join(
-            self.directory, hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
-        )
-
-    def __setitem__(self, key: str, value: bytes) -> None:
-        with open(self.__to_file(key), "wb") as o:
-            o.write(value)
-
-    def get(self, key: str) -> Optional[bytes]:
-        f = self.__to_file(key)
-        if not os.path.exists(f):
-            return None
-        with open(f, "rb") as i:
-            return i.read()
-
-    def __delitem__(self, key: str) -> None:
-        try:
-            os.unlink(self.__to_file(key))
-        except FileNotFoundError:
-            raise KeyError()
 
 
 class Frozen(Exception):

@@ -15,7 +15,7 @@ from hypothesis import HealthCheck, Phase, given, note, reject, settings
 from hypothesis import strategies as st
 
 import minithesis as mt
-from minithesis import CachedTestFunction, DirectoryDB, Frozen, Possibility, Status
+from minithesis import Frozen, Possibility, Status
 from minithesis import TestCase as TC
 from minithesis import TestingState as State
 from minithesis import (
@@ -42,11 +42,10 @@ def list_of_integers(test_case):
 def test_finds_small_list(capsys, seed):
 
     with pytest.raises(AssertionError):
-
-        @run_test(database={}, random=Random(seed))
-        def _(test_case):
+        def t0(test_case):
             ls = test_case.any(lists(integers(0, 10000)))
             assert sum(ls) <= 1000
+        run_test(t0, random=Random(seed))
 
     captured = capsys.readouterr()
 
@@ -76,12 +75,12 @@ def test_finds_small_list_even_with_bad_lists(capsys, seed):
         def bad_list(test_case):
             n = test_case.choice(10)
             return [test_case.choice(10000) for _ in range(n)]
-
-        @run_test(database={}, random=Random(seed))
-        def _(test_case):
+        def t0(test_case):
             ls = test_case.any(bad_list)
             assert sum(ls) <= 1000
 
+        run_test(t0, random=Random(seed))
+        
     captured = capsys.readouterr()
 
     assert captured.out.strip() == "any(bad_list): [1001]"
@@ -91,11 +90,11 @@ def test_reduces_additive_pairs(capsys):
 
     with pytest.raises(AssertionError):
 
-        @run_test(database={}, max_examples=10000)
-        def _(test_case):
+        def t0(test_case):
             m = test_case.choice(1000)
             n = test_case.choice(1000)
             assert m + n <= 1000
+        run_test(t0, max_examples=10000)
 
     captured = capsys.readouterr()
 
@@ -105,194 +104,38 @@ def test_reduces_additive_pairs(capsys):
     ]
 
 
-def test_reuses_results_from_the_database(tmpdir):
-    db = DirectoryDB(tmpdir)
-    count = 0
-
-    def run():
-        with pytest.raises(AssertionError):
-
-            @run_test(database=db)
-            def _(test_case):
-                nonlocal count
-                count += 1
-                assert test_case.choice(10000) < 10
-
-    run()
-
-    assert len(tmpdir.listdir()) == 1
-    prev_count = count
-
-    run()
-
-    assert len(tmpdir.listdir()) == 1
-    assert count == prev_count + 2
-
-
 def test_test_cases_satisfy_preconditions():
-    @run_test()
-    def _(test_case):
+    def t0(test_case):
         n = test_case.choice(10)
         test_case.assume(n != 0)
         assert n != 0
+    run_test(t0)
 
 
 def test_error_on_too_strict_precondition():
     with pytest.raises(Unsatisfiable):
-
-        @run_test()
-        def _(test_case):
+        def t0(test_case):
             n = test_case.choice(10)
             test_case.reject()
+        run_test(t0)
 
 
 def test_error_on_unbounded_test_function(monkeypatch):
     monkeypatch.setattr(mt, "BUFFER_SIZE", 10)
     with pytest.raises(Unsatisfiable):
 
-        @run_test(max_examples=5)
-        def _(test_case):
+        def t0(test_case):
             while True:
                 test_case.choice(10)
-
-
-def test_function_cache():
-    def tf(tc):
-        if tc.choice(1000) >= 200:
-            tc.mark_status(Status.INTERESTING)
-        if tc.choice(1) == 0:
-            tc.reject()
-
-    state = State(Random(0), tf, 100)
-
-    cache = CachedTestFunction(state.test_function)
-
-    assert cache([1, 1]) == Status.VALID
-    assert cache([1]) == Status.OVERRUN
-    assert cache([1000]) == Status.INTERESTING
-    assert cache([1000]) == Status.INTERESTING
-    assert cache([1000, 1]) == Status.INTERESTING
-
-    assert state.calls == 2
-
-
-@pytest.mark.parametrize("max_examples", range(1, 100))
-def test_max_examples_is_not_exceeded(max_examples):
-    """Targeting has a number of places it checks for
-    whether we've exceeded the generation limits. This
-    makes sure we've checked them all.
-    """
-    calls = 0
-
-    @run_test(database={}, random=Random(0), max_examples=max_examples)
-    def _(tc):
-        nonlocal calls
-        m = 10000
-        n = tc.choice(m)
-        calls += 1
-        tc.target(n * (m - n))
-
-    assert calls == max_examples
-
-
-@pytest.mark.parametrize("seed", range(100))
-def test_finds_a_local_maximum(seed):
-    """Targeting has a number of places it checks for
-    whether we've exceeded the generation limits. This
-    makes sure we've checked them all.
-    """
-
-    with pytest.raises(AssertionError):
-
-        @run_test(database={}, random=Random(seed), max_examples=200, quiet=True)
-        def _(tc):
-            m = tc.choice(1000)
-            n = tc.choice(1000)
-            score = -((m - 500) ** 2 + (n - 500) ** 2)
-            tc.target(score)
-            assert m != 500 or n != 500
-
-
-def test_can_target_a_score_upwards_to_interesting(capsys):
-    with pytest.raises(AssertionError):
-
-        @run_test(database={}, max_examples=1000)
-        def _(test_case):
-            n = test_case.choice(1000)
-            m = test_case.choice(1000)
-            score = n + m
-            test_case.target(score)
-            assert score < 2000
-
-    captured = capsys.readouterr()
-
-    assert [c.strip() for c in captured.out.splitlines()] == [
-        "choice(1000): 1000",
-        "choice(1000): 1000",
-    ]
-
-
-def test_can_target_a_score_upwards_without_failing():
-    max_score = 0
-
-    @run_test(database={}, max_examples=1000)
-    def _(test_case):
-        nonlocal max_score
-        n = test_case.choice(1000)
-        m = test_case.choice(1000)
-        score = n + m
-        test_case.target(score)
-        max_score = max(score, max_score)
-
-    assert max_score == 2000
-
-
-def test_targeting_when_most_do_not_benefit(capsys):
-    with pytest.raises(AssertionError):
-        big = 10000
-
-        @run_test(database={}, max_examples=1000)
-        def _(test_case):
-            test_case.choice(1000)
-            test_case.choice(1000)
-            score = test_case.choice(big)
-            test_case.target(score)
-            assert score < big
-
-    captured = capsys.readouterr()
-
-    assert [c.strip() for c in captured.out.splitlines()] == [
-        "choice(1000): 0",
-        "choice(1000): 0",
-        f"choice({big}): {big}",
-    ]
-
-
-def test_can_target_a_score_downwards(capsys):
-    with pytest.raises(AssertionError):
-
-        @run_test(database={}, max_examples=1000)
-        def _(test_case):
-            n = test_case.choice(1000)
-            m = test_case.choice(1000)
-            score = n + m
-            test_case.target(-score)
-            assert score > 0
-
-    captured = capsys.readouterr()
-
-    assert [c.strip() for c in captured.out.splitlines()] == [
-        "choice(1000): 0",
-        "choice(1000): 0",
-    ]
+        run_test(t0, max_examples=5)
 
 
 def test_prints_a_top_level_weighted(capsys):
     with pytest.raises(AssertionError):
 
-        @run_test(database={}, max_examples=1000)
-        def _(test_case):
+        def t0(test_case):
             assert test_case.weighted(0.5)
+        run_test(t0, max_examples=1000)
 
     captured = capsys.readouterr()
     assert captured.out.strip() == "weighted(0.5): False"
@@ -319,116 +162,95 @@ def test_errors_on_too_large_choice():
 
 
 def test_can_choose_full_64_bits():
-    @run_test()
-    def _(tc):
+    def t0(tc):
         tc.choice(2 ** 64 - 1)
 
+    run_test(t0)
+    
 
 def test_mapped_possibility():
-    @run_test()
-    def _(tc):
+    def t0(tc):
         n = tc.any(integers(0, 5).map(lambda n: n * 2))
         assert n % 2 == 0
 
+    run_test(t0)
+    
 
 def test_selected_possibility():
-    @run_test()
-    def _(tc):
+    def t0(tc):
         n = tc.any(integers(0, 5).satisfying(lambda n: n % 2 == 0))
         assert n % 2 == 0
-
+    run_test(t0)
+    
 
 def test_bound_possibility():
-    @run_test()
-    def _(tc):
+    def t0(tc):
         m, n = tc.any(
             integers(0, 5).bind(lambda m: tuples(just(m), integers(m, m + 10),))
         )
 
         assert m <= n <= m + 10
-
+    run_test(t0)
+    
 
 def test_cannot_witness_nothing():
     with pytest.raises(Unsatisfiable):
 
-        @run_test()
-        def _(tc):
+        
+        def t0(tc):
             tc.any(nothing())
-
+        run_test(t0)
 
 def test_cannot_witness_empty_mix_of():
     with pytest.raises(Unsatisfiable):
 
-        @run_test()
-        def _(tc):
+        def t0(tc):
             tc.any(mix_of())
-
+        run_test(t0)
 
 def test_can_draw_mixture():
-    @run_test()
-    def _(tc):
+    def t0(tc):
         m = tc.any(mix_of(integers(-5, 0), integers(2, 5)))
         assert -5 <= m <= 5
         assert m != 1
-
-
-def test_target_and_reduce(capsys):
-    """This test is very hard to trigger without targeting,
-    and targeting will tend to overshoot the score, so we
-    will see multiple interesting test cases before
-    shrinking."""
-    with pytest.raises(AssertionError):
-
-        @run_test(database={})
-        def _(tc):
-            m = tc.choice(100000)
-            tc.target(m)
-            assert m <= 99900
-
-    captured = capsys.readouterr()
-
-    assert captured.out.strip() == "choice(100000): 99901"
-
+    run_test(t0)
 
 def test_impossible_weighted():
     with pytest.raises(Failure):
 
-        @run_test(database={})
-        def _(tc):
+        def t0(tc):
             tc.choice(1)
             for _ in range(10):
                 if tc.weighted(0.0):
                     assert False
             if tc.choice(1):
                 raise Failure()
-
+        run_test(t0)
 
 def test_guaranteed_weighted():
     with pytest.raises(Failure):
 
-        @run_test(database={})
-        def _(tc):
+        def t0(tc):
             if tc.weighted(1.0):
                 tc.choice(1)
                 raise Failure()
             else:
                 assert False
+        run_test(t0)
 
 
 def test_size_bounds_on_list():
-    @run_test(database={})
-    def _(tc):
+    def t0(tc):
         ls = tc.any(lists(integers(0, 10), min_size=1, max_size=3))
         assert 1 <= len(ls) <= 3
+    run_test(t0)
 
 
 def test_forced_choice_bounds():
     with pytest.raises(ValueError):
-
-        @run_test(database={})
-        def _(tc):
+        def t0(tc):
             tc.forced_choice(2 ** 64)
-
+        run_test(t0)
 
 class Failure(Exception):
     pass
@@ -451,7 +273,6 @@ def test_give_minithesis_a_workout(data):
             st.just("mark_status"),
             st.sampled_from((Status.INVALID, Status.VALID, Status.INTERESTING)),
         ),
-        st.tuples(st.just("target"), st.floats(0.0, 1.0)),
         st.tuples(st.just("choice"), st.integers(0, 1000)),
         st.tuples(st.just("weighted"), st.floats(0.0, 1.0)),
     )
@@ -461,17 +282,12 @@ def test_give_minithesis_a_workout(data):
 
     tree = new_node()
 
-    database = {}
     failed = False
     call_count = 0
     valid_count = 0
 
     try:
         try:
-
-            @run_test(
-                max_examples=max_examples, random=rnd, database=database, quiet=True,
-            )
             def test_function(test_case):
                 node = tree
                 depth = 0
@@ -492,6 +308,9 @@ def test_give_minithesis_a_workout(data):
                     result = getattr(test_case, name)(*rest)
                     node = node[1][result]
 
+            run_test(
+                test_function, max_examples=max_examples, random=rnd, quiet=True,
+            )
         except Failure:
             failed = True
         except Unsatisfiable:
@@ -542,9 +361,6 @@ def test_give_minithesis_a_workout(data):
                         lines.append(
                             " " * indent + f"tc.mark_status(Status.{args[0].name})"
                         )
-                elif method == "target":
-                    lines.append(" " * indent + f"tc.target({args[0]})")
-                    recur(indent, *node[1].values())
                 elif method == "weighted":
                     cond = f"tc.weighted({args[0]})"
                     assert len(node[1]) > 0
@@ -591,8 +407,7 @@ def test_give_minithesis_a_workout(data):
 def test_failure_from_hypothesis_1():
     with pytest.raises(Failure):
 
-        @run_test(max_examples=1000, database={}, random=Random(100))
-        def _(tc):
+        def t0(tc):
             n1 = tc.weighted(0.0)
             if not n1:
                 n2 = tc.choice(511)
@@ -608,13 +423,12 @@ def test_failure_from_hypothesis_1():
                     raise Failure()
                 else:
                     tc.mark_status(Status.INVALID)
-
+        run_test(t0, max_examples=1000,  random=Random(100))
 
 def test_failure_from_hypothesis_2():
     with pytest.raises(Failure):
 
-        @run_test(max_examples=1000, database={}, random=Random(0))
-        def _(tc):
+        def t0(tc):
             n1 = tc.choice(6)
             if n1 == 6:
                 n2 = tc.weighted(0.0)
@@ -630,3 +444,4 @@ def test_failure_from_hypothesis_2():
                 raise Failure()
             else:
                 tc.mark_status(Status.INVALID)
+        run_test(t0, max_examples=1000,  random=Random(0))
