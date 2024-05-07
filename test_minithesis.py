@@ -16,7 +16,7 @@ from hypothesis import strategies as st
 
 import minithesis as mt
 from minithesis import Frozen, Possibility, Status
-from minithesis import TestCase as TC
+from minithesis import TestData as TC
 from minithesis import TestingState as State
 from minithesis import (
     Unsatisfiable,

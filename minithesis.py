@@ -68,7 +68,7 @@ T = TypeVar("T", covariant=True)
 S = TypeVar("S", covariant=True)
 U = TypeVar("U")  # Invariant
 
-def run_test(test: Callable[[TestCase],None],
+def run_test(test: Callable[[TestData],None],
     max_examples: int = 100,
     random: Optional[Random] = None,
     quiet: bool = False,
@@ -103,30 +103,67 @@ def run_test(test: Callable[[TestCase],None],
     * quiet: Will not print anything on failure if True.
     """
 
-    def mark_failures_interesting(test_case: TestCase) -> None:
+    def mark_failures_interesting(test_case: TestData) -> None:
         try:
             test(test_case)
         except Exception:
             if test_case.status is not None:
                 raise
             test_case.mark_status(Status.INTERESTING)
-
     state = TestingState(
         random or Random(), mark_failures_interesting, max_examples
     )
 
-    if state.result is None:
-        state.run()
+    #Run random generation until either we have found an interesting
+    #    test case or hit the limit of how many test cases we should
+    #    evaluate.
+    while (
+            not state.test_is_trivial
+            and state.result is None
+            and state.valid_test_cases < state.max_examples
+            and
+            # We impose a limit on the maximum number of calls as
+            # well as the maximum number of valid examples. This is
+            # to avoid taking a prohibitively long time on tests which
+            # have hard or impossible to satisfy preconditions.
+            state.calls < state.max_examples * 10
+        ) :
+        test_case = TestData(prefix=(), random=state.random, max_size=BUFFER_SIZE)
+        try:
+            test(test_case)
+        except StopTest:
+            pass
+        except Exception:
+            if test_case.status is not None:
+                raise
+            test_case.status = Status.INTERESTING
+
+        if test_case.status is None:
+            test_case.status = Status.VALID
+
+        state.calls += 1
+        if test_case.status >= Status.INVALID and len(test_case.choices) == 0:
+            state.test_is_trivial = True
+        if test_case.status >= Status.VALID:
+            state.valid_test_cases += 1
+
+        if test_case.status == Status.INTERESTING and (
+            state.result is None or sort_key(test_case.choices) < sort_key(state.result)
+        ):
+            state.result = test_case.choices
+
+
+    state.shrink()
 
     if state.valid_test_cases == 0:
         raise Unsatisfiable()
 
     if state.result is not None:
-        test(TestCase.for_choices(state.result, print_results=not quiet))
+        test(TestData.for_choices(state.result, print_results=not quiet))
 
 
 
-class TestCase(object):
+class TestData(object):
     """Represents a single generated test case, which consists
     of an underlying set of choices that produce possibilities."""
 
@@ -135,9 +172,9 @@ class TestCase(object):
         cls,
         choices: Sequence[int],
         print_results: bool = False,
-    ) -> TestCase:
+    ) -> TestData:
         """Returns a test case that makes this series of choices."""
-        return TestCase(
+        return TestData(
             prefix=choices,
             random=None,
             max_size=len(choices),
@@ -252,7 +289,7 @@ class Possibility(Generic[T]):
     Pass one of these to TestCase.any to get a concrete value.
     """
 
-    def __init__(self, produce: Callable[[TestCase], T], name: Optional[str] = None):
+    def __init__(self, produce: Callable[[TestData], T], name: Optional[str] = None):
         self.produce = produce
         self.name = produce.__name__ if name is None else name
 
@@ -273,7 +310,7 @@ class Possibility(Generic[T]):
         to some possible value for ``self`` then returning a possible
         value from that."""
 
-        def produce(test_case: TestCase) -> S:
+        def produce(test_case: TestData) -> S:
             return test_case.any(f(test_case.any(self)))
 
         return Possibility[S](
@@ -285,7 +322,7 @@ class Possibility(Generic[T]):
         """Returns a ``Possibility`` whose values are any possible
         value of ``self`` for which ``f`` returns True."""
 
-        def produce(test_case: TestCase) -> T:
+        def produce(test_case: TestData) -> T:
             for _ in range(3):
                 candidate = test_case.any(self)
                 if f(candidate):
@@ -307,7 +344,7 @@ def lists(
 ) -> Possibility[List[U]]:
     """Any lists whose elements are possible values from ``elements`` are possible."""
 
-    def produce(test_case: TestCase) -> List[U]:
+    def produce(test_case: TestData) -> List[U]:
         result: List[U] = []
         while True:
             if len(result) < min_size:
@@ -332,7 +369,7 @@ def nothing() -> Possibility[NoReturn]:
     """No possible values. i.e. Any call to ``any`` will reject
     the test case."""
 
-    def produce(tc: TestCase) -> NoReturn:
+    def produce(tc: TestData) -> NoReturn:
         tc.reject()
 
     return Possibility(produce)
@@ -375,7 +412,7 @@ class TestingState(object):
     def __init__(
         self,
         random: Random,
-        test_function: Callable[[TestCase], None],
+        test_function: Callable[[TestData], None],
         max_examples: int,
     ):
         self.random = random
@@ -384,10 +421,9 @@ class TestingState(object):
         self.valid_test_cases = 0
         self.calls = 0
         self.result: Optional[array[int]] = None
-        self.best_scoring: Optional[Tuple[int, Sequence[int]]] = None
         self.test_is_trivial = False
 
-    def test_function(self, test_case: TestCase) -> None:
+    def test_function(self, test_case: TestData) -> None:
         try:
             self.__test_function(test_case)
         except StopTest:
@@ -405,34 +441,6 @@ class TestingState(object):
         ):
             self.result = test_case.choices
 
-
-    def run(self) -> None:
-        self.generate()
-        self.shrink()
-
-    def should_keep_generating(self) -> bool:
-        return (
-            not self.test_is_trivial
-            and self.result is None
-            and self.valid_test_cases < self.max_examples
-            and
-            # We impose a limit on the maximum number of calls as
-            # well as the maximum number of valid examples. This is
-            # to avoid taking a prohibitively long time on tests which
-            # have hard or impossible to satisfy preconditions.
-            self.calls < self.max_examples * 10
-        )
-
-    def generate(self) -> None:
-        """Run random generation until either we have found an interesting
-        test case or hit the limit of how many test cases we should
-        evaluate."""
-        while self.should_keep_generating() and (
-            self.best_scoring is None or self.valid_test_cases <= self.max_examples // 2
-        ):
-            self.test_function(
-                TestCase(prefix=(), random=self.random, max_size=BUFFER_SIZE)
-            )
 
     def shrink(self) -> None:
         """If we have found an interesting example, try shrinking it
@@ -456,7 +464,7 @@ class TestingState(object):
         def consider(choices: array[int]) -> bool:
             if choices == self.result:
                 return True
-            test_case = TestCase.for_choices(choices)
+            test_case = TestData.for_choices(choices)
             self.test_function(test_case)
             assert test_case.status is not None
             return test_case.status == Status.INTERESTING
