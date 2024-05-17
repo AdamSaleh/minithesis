@@ -68,7 +68,7 @@ T = TypeVar("T", covariant=True)
 S = TypeVar("S", covariant=True)
 U = TypeVar("U")  # Invariant
 
-def run_test(test: Callable[[TestData],None],
+def run_test(possibility: Possibility[U], test: Callable[[U],None],
     max_examples: int = 100,
     random: Optional[Random] = None,
     quiet: bool = False,
@@ -104,12 +104,11 @@ def run_test(test: Callable[[TestData],None],
     """
 
     def mark_failures_interesting(test_case: TestData) -> None:
-        try:
-            test(test_case)
-        except Exception:
-            if test_case.status is not None:
-                raise
-            test_case.mark_status(Status.INTERESTING)
+            data = test_case.any(possibility)
+            r = test(data)
+            if not r:
+                test_case.mark_status(Status.INTERESTING)
+
     state = TestingState(
         random or Random(), mark_failures_interesting, max_examples
     )
@@ -130,7 +129,8 @@ def run_test(test: Callable[[TestData],None],
         ) :
         test_case = TestData(prefix=(), random=state.random, max_size=BUFFER_SIZE)
         try:
-            test(test_case)
+            data = test_case.any(possibility)
+            test(data)
         except StopTest:
             pass
         except Exception:
@@ -153,13 +153,14 @@ def run_test(test: Callable[[TestData],None],
             state.result = test_case.choices
 
 
-    state.shrink()
+    state.shrink(possibility)
 
     if state.valid_test_cases == 0:
         raise Unsatisfiable()
 
     if state.result is not None:
-        test(TestData.for_choices(state.result, print_results=not quiet))
+        data = TestData.for_choices(state.result, print_results=not quiet).any(possibility)
+        test(data)
 
 
 
@@ -423,26 +424,8 @@ class TestingState(object):
         self.result: Optional[array[int]] = None
         self.test_is_trivial = False
 
-    def test_function(self, test_case: TestData) -> None:
-        try:
-            self.__test_function(test_case)
-        except StopTest:
-            pass
-        if test_case.status is None:
-            test_case.status = Status.VALID
-        self.calls += 1
-        if test_case.status >= Status.INVALID and len(test_case.choices) == 0:
-            self.test_is_trivial = True
-        if test_case.status >= Status.VALID:
-            self.valid_test_cases += 1
 
-        if test_case.status == Status.INTERESTING and (
-            self.result is None or sort_key(test_case.choices) < sort_key(self.result)
-        ):
-            self.result = test_case.choices
-
-
-    def shrink(self) -> None:
+    def shrink(self, possibility) -> None:
         """If we have found an interesting example, try shrinking it
         so that the choice sequence leading to our best example is
         shortlex smaller than the one we originally found. This improves
@@ -465,7 +448,26 @@ class TestingState(object):
             if choices == self.result:
                 return True
             test_case = TestData.for_choices(choices)
-            self.test_function(test_case)
+
+            try:
+                #data = test_case.any(possibility)
+                self.__test_function(test_case)
+            except StopTest:
+                pass
+            if test_case.status is None:
+                test_case.status = Status.VALID
+            self.calls += 1
+            if test_case.status >= Status.INVALID and len(test_case.choices) == 0:
+                self.test_is_trivial = True
+            if test_case.status >= Status.VALID:
+                self.valid_test_cases += 1
+
+            if test_case.status == Status.INTERESTING and (
+                self.result is None or sort_key(test_case.choices) < sort_key(self.result)
+            ):
+                self.result = test_case.choices
+                
+
             assert test_case.status is not None
             return test_case.status == Status.INTERESTING
 
