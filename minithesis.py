@@ -103,14 +103,9 @@ def run_test(possibility: Possibility[U], test: Callable[[U],None],
     * quiet: Will not print anything on failure if True.
     """
 
-    def mark_failures_interesting(test_case: TestData) -> None:
-            data = test_case.any(possibility)
-            r = test(data)
-            if not r:
-                test_case.mark_status(Status.INTERESTING)
 
     state = TestingState(
-        random or Random(), mark_failures_interesting, max_examples
+        random or Random(), test, max_examples
     )
 
     #Run random generation until either we have found an interesting
@@ -130,7 +125,7 @@ def run_test(possibility: Possibility[U], test: Callable[[U],None],
         test_case = TestData(prefix=(), random=state.random, max_size=BUFFER_SIZE)
         try:
             data = test_case.any(possibility)
-            test(data)
+            assert test(data)
         except StopTest:
             pass
         except Exception:
@@ -160,7 +155,7 @@ def run_test(possibility: Possibility[U], test: Callable[[U],None],
 
     if state.result is not None:
         data = TestData.for_choices(state.result, print_results=not quiet).any(possibility)
-        test(data)
+        assert test(data)
 
 
 
@@ -450,8 +445,10 @@ class TestingState(object):
             test_case = TestData.for_choices(choices)
 
             try:
-                #data = test_case.any(possibility)
-                self.__test_function(test_case)
+                data = test_case.any(possibility)
+                r = self.__test_function(data)
+                if not r:
+                    test_case.mark_status(Status.INTERESTING)
             except StopTest:
                 pass
             if test_case.status is None:

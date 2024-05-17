@@ -30,7 +30,7 @@ from minithesis import (
 )
 
 def t_pass(tc):
-            pass
+    return True
 
 
 @Possibility
@@ -46,7 +46,7 @@ def test_finds_small_list(capsys, seed):
 
     with pytest.raises(AssertionError):
         def t0(ls):
-            assert sum(ls) <= 1000
+            return sum(ls) <= 1000
         run_test(
             lists(integers(0, 10000)),
             t0,
@@ -81,7 +81,7 @@ def test_finds_small_list_even_with_bad_lists(capsys, seed):
             n = test_case.choice(10)
             return [test_case.choice(10000) for _ in range(n)]
         def t0(ls):
-            assert sum(ls) <= 1000
+            return sum(ls) <= 1000
 
         run_test(bad_list, t0, random=Random(seed))
         
@@ -101,7 +101,7 @@ def test_reduces_additive_pairs(capsys):
 
         def t0(t):
             m,n = t
-            assert m + n <= 1000
+            return m + n <= 1000
         run_test(tupl, t0, max_examples=10000)
 
     captured = capsys.readouterr()
@@ -117,7 +117,7 @@ def test_test_cases_satisfy_preconditions():
         return n
     
     def t0(n):
-        assert n != 0
+        return n != 0
     run_test(non0, t0)
 
 
@@ -128,9 +128,8 @@ def test_error_on_too_strict_precondition():
             n = test_case.choice(10)
             test_case.reject()
             return n
-        def t0(n):
-            pass
-        run_test(r0,t0)
+
+        run_test(r0,t_pass)
 
 
 def test_error_on_unbounded_test_function(monkeypatch):
@@ -142,10 +141,7 @@ def test_error_on_unbounded_test_function(monkeypatch):
                 n = test_case.choice(10)
             return n
 
-        def t0(n):
-            pass
-
-        run_test(r0,t0, max_examples=5)
+        run_test(r0,t_pass, max_examples=5)
 
 
 #def test_prints_a_top_level_weighted(capsys):
@@ -186,29 +182,28 @@ def test_can_choose_full_64_bits():
     @Possibility
     def p0(tc):
         return tc.choice(2 ** 64 - 1)
-    def t0(_):
-        pass
-    run_test(p0,t0)
+
+    run_test(p0,t_pass)
     
 
 def test_mapped_possibility():
     def t0(n):
-        assert n % 2 == 0
+        return n % 2 == 0
 
     run_test(integers(0, 5).map(lambda n: n * 2),t0)
     
 
 def test_selected_possibility():
     def t0(n):
-        assert n % 2 == 0
+        return n % 2 == 0
     run_test(integers(0, 5).satisfying(lambda n: n % 2 == 0),t0)
     
 
 def test_bound_possibility():
     def t0(tc):
         m, n = tc
+        return m <= n <= m + 10
 
-        assert m <= n <= m + 10
     run_test(
         integers(0, 5).bind(lambda m: tuples(just(m), integers(m, m + 10),))
         ,t0)
@@ -216,11 +211,7 @@ def test_bound_possibility():
 
 def test_cannot_witness_nothing():
     with pytest.raises(Unsatisfiable):
-
-        def t0(tc):
-            pass
-
-        run_test(nothing(),t0)
+        run_test(nothing(),t_pass)
 
 def test_cannot_witness_empty_mix_of():
     with pytest.raises(Unsatisfiable):
@@ -229,8 +220,7 @@ def test_cannot_witness_empty_mix_of():
 
 def test_can_draw_mixture():
     def t0(m):
-        assert -5 <= m <= 5
-        assert m != 1
+        return (-5 <= m <= 5) and (m != 1)
 
     run_test(mix_of(integers(-5, 0), integers(2, 5)),t0)
 
@@ -262,7 +252,7 @@ def test_guaranteed_weighted():
 
 def test_size_bounds_on_list():
     def t0(ls):
-        assert 1 <= len(ls) <= 3
+        return 1 <= len(ls) <= 3
     run_test(lists(integers(0, 10), min_size=1, max_size=3),t0)
 
 
