@@ -28,8 +28,6 @@ in order of most to least important:
 
 1. Test case generation.
 2. Test case reduction ("shrinking")
-3. A small library of primitive possibilities (generators) and combinators.
-
 
 Anything that supports 1 and 2 is a reasonable good first porting
 goal. You'll probably want to port most of the possibilities library
@@ -48,11 +46,8 @@ from enum import IntEnum
 from random import Random
 from typing import (
     cast,
-    Any,
     Callable,
-    Dict,
     Generic,
-    List,
     Mapping,
     NoReturn,
     Optional,
@@ -60,7 +55,6 @@ from typing import (
     Sequence,
     Tuple,
     TypeVar,
-    Union,
 )
 
 
@@ -68,25 +62,12 @@ T = TypeVar("T", covariant=True)
 S = TypeVar("S", covariant=True)
 U = TypeVar("U")  # Invariant
 
-def run_test(possibility: Possibility[U], test: Callable[[U],None],
+def run_test(choice: Callable[[TestData],U], test: Callable[[U],None],
     max_examples: int = 100,
     random: Optional[Random] = None,
     quiet: bool = False,
 ) -> None:
-    """Decorator to run a test. Usage is:
-
-    .. code-block: python
-
-        @run_test()
-        def _(test_case):
-            n = test_case.choice(1000)
-            ...
-
-    The decorated function takes a ``TestCase`` argument,
-    and should raise an exception to indicate a test failure.
-    It will either run silently or print drawn values and then
-    fail with an exception if minithesis finds some test case
-    that fails.
+    """A Test runner
 
     The test will be run immediately, unlike in Hypothesis where
     @given wraps a function to expose it to the the test runner.
@@ -124,7 +105,7 @@ def run_test(possibility: Possibility[U], test: Callable[[U],None],
         ) :
         test_case = TestData(prefix=(), random=state.random, max_size=BUFFER_SIZE)
         try:
-            data = test_case.any(possibility)
+            data = choice(test_case)
             assert test(data)
         except StopTest:
             pass
@@ -148,15 +129,14 @@ def run_test(possibility: Possibility[U], test: Callable[[U],None],
             state.result = test_case.choices
 
 
-    state.shrink(possibility)
+    state.shrink(choice)
 
     if state.valid_test_cases == 0:
         raise Unsatisfiable()
 
     if state.result is not None:
-        data = TestData.for_choices(state.result, print_results=not quiet).any(possibility)
+        data = choice(TestData.for_choices(state.result, print_results=not quiet))
         assert test(data)
-
 
 
 class TestData(object):
@@ -191,6 +171,7 @@ class TestData(object):
         self.max_size = max_size
         self.choices: array[int] = array("Q")
         self.status: Optional[Status] = None
+        self.exception = None
         self.print_results = print_results
         self.depth = 0
 
@@ -204,11 +185,11 @@ class TestData(object):
     def weighted(self, p: float) -> int:
         """Return True with probability ``p``."""
         if p <= 0:
-            result = self.forced_choice(0)
+            result = self.__make_choice(0, lambda: 0, True)
         elif p >= 1:
-            result = self.forced_choice(1)
+            result = self.__make_choice(1, lambda: 1, True)
         else:
-            result = bool(self.__make_choice(1, lambda: int(self.random.random() <= p)))
+            result = self.__make_choice(1, lambda: int(self.random.random() <= p))
         if self.__should_print():
             print(f"weighted({p}): {result}")
         return result
@@ -218,14 +199,10 @@ class TestData(object):
         some call to choice() had returned ``n``. You almost never
         need this, but sometimes it can be a useful hint to the
         shrinker."""
-        if n.bit_length() > 64 or n < 0:
-            raise ValueError(f"Invalid choice {n}")
-        if self.status is not None:
-            raise Frozen()
-        if len(self.choices) >= self.max_size:
-            self.mark_status(Status.OVERRUN)
-        self.choices.append(n)
-        return n
+        result = self.__make_choice(n, lambda: n, True)
+        if self.__should_print():
+            print(f"forced choice({n}): {result}")
+        return result
 
     def reject(self) -> NoReturn:
         """Mark this test case as invalid."""
@@ -237,17 +214,6 @@ class TestData(object):
         if not precondition:
             self.reject()
 
-    def any(self, possibility: Possibility[U]) -> U:
-        """Return a possible value from ``possibility``."""
-        try:
-            self.depth += 1
-            result = possibility.produce(self)
-        finally:
-            self.depth -= 1
-
-        if self.__should_print():
-            print(f"any({possibility}): {result}")
-        return result
 
     def mark_status(self, status: Status) -> NoReturn:
         """Set the status and raise StopTest."""
@@ -259,7 +225,10 @@ class TestData(object):
     def __should_print(self) -> bool:
         return self.print_results and self.depth == 0
 
-    def __make_choice(self, n: int, rnd_method: Callable[[], int]) -> int:
+    def should_print(self) -> bool:
+        return self.print_results and self.depth == 0
+
+    def __make_choice(self, n: int, rnd_method: Callable[[], int], forced=False) -> int:
         """Make a choice in [0, n], by calling rnd_method if
         randomness is needed."""
         if n.bit_length() > 64 or n < 0:
@@ -268,7 +237,7 @@ class TestData(object):
             raise Frozen()
         if len(self.choices) >= self.max_size:
             self.mark_status(Status.OVERRUN)
-        if len(self.choices) < len(self.prefix):
+        if len(self.choices) < len(self.prefix) and not forced:
             result = self.prefix[len(self.choices)]
         else:
             result = rnd_method()
@@ -276,120 +245,6 @@ class TestData(object):
         if result > n:
             self.mark_status(Status.INVALID)
         return result
-
-
-class Possibility(Generic[T]):
-    """Represents some range of values that might be used in
-    a test, that can be requested from a ``TestCase``.
-
-    Pass one of these to TestCase.any to get a concrete value.
-    """
-
-    def __init__(self, produce: Callable[[TestData], T], name: Optional[str] = None):
-        self.produce = produce
-        self.name = produce.__name__ if name is None else name
-
-    def __repr__(self) -> str:
-        return self.name
-
-    def map(self, f: Callable[[T], S]) -> Possibility[S]:
-        """Returns a ``Possibility`` where values come from
-        applying ``f`` to some possible value for ``self``."""
-        return Possibility(
-            lambda test_case: f(test_case.any(self)),
-            name=f"{self.name}.map({f.__name__})",
-        )
-
-    def bind(self, f: Callable[[T], Possibility[S]]) -> Possibility[S]:
-        """Returns a ``Possibility`` where values come from
-        applying ``f`` (which should return a new ``Possibility``
-        to some possible value for ``self`` then returning a possible
-        value from that."""
-
-        def produce(test_case: TestData) -> S:
-            return test_case.any(f(test_case.any(self)))
-
-        return Possibility[S](
-            produce,
-            name=f"{self.name}.bind({f.__name__})",
-        )
-
-    def satisfying(self, f: Callable[[T], bool]) -> Possibility[T]:
-        """Returns a ``Possibility`` whose values are any possible
-        value of ``self`` for which ``f`` returns True."""
-
-        def produce(test_case: TestData) -> T:
-            for _ in range(3):
-                candidate = test_case.any(self)
-                if f(candidate):
-                    return candidate
-            test_case.reject()
-
-        return Possibility[T](produce, name=f"{self.name}.select({f.__name__})")
-
-
-def integers(m: int, n: int) -> Possibility[int]:
-    """Any integer in the range [m, n] is possible"""
-    return Possibility(lambda tc: m + tc.choice(n - m), name=f"integers({m}, {n})")
-
-
-def lists(
-    elements: Possibility[U],
-    min_size: int = 0,
-    max_size: float = float("inf"),
-) -> Possibility[List[U]]:
-    """Any lists whose elements are possible values from ``elements`` are possible."""
-
-    def produce(test_case: TestData) -> List[U]:
-        result: List[U] = []
-        while True:
-            if len(result) < min_size:
-                test_case.forced_choice(1)
-            elif len(result) + 1 >= max_size:
-                test_case.forced_choice(0)
-                break
-            elif not test_case.weighted(0.9):
-                break
-            result.append(test_case.any(elements))
-        return result
-
-    return Possibility[List[U]](produce, name=f"lists({elements.name})")
-
-
-def just(value: U) -> Possibility[U]:
-    """Only ``value`` is possible."""
-    return Possibility[U](lambda tc: value, name=f"just({value})")
-
-
-def nothing() -> Possibility[NoReturn]:
-    """No possible values. i.e. Any call to ``any`` will reject
-    the test case."""
-
-    def produce(tc: TestData) -> NoReturn:
-        tc.reject()
-
-    return Possibility(produce)
-
-
-def mix_of(*possibilities: Possibility[T]) -> Possibility[T]:
-    """Possible values can be any value possible for one of ``possibilities``."""
-    if not possibilities:
-        # XXX Need a cast since NoReturn isn't a T (though perhaps it should be)
-        return cast(Possibility[T], nothing())
-    return Possibility(
-        lambda tc: tc.any(possibilities[tc.choice(len(possibilities) - 1)]),
-        name="mix_of({', '.join(p.name for p in possibilities)})",
-    )
-
-
-# XXX This signature requires PEP 646
-def tuples(*possibilities: Possibility[Any]) -> Possibility[Any]:
-    """Any tuple t of of length len(possibilities) such that t[i] is possible
-    for possibilities[i] is possible."""
-    return Possibility(
-        lambda tc: tuple(tc.any(p) for p in possibilities),
-        name="tuples({', '.join(p.name for p in possibilities)})",
-    )
 
 
 # We cap the maximum amount of entropy a test case can use.
@@ -420,7 +275,7 @@ class TestingState(object):
         self.test_is_trivial = False
 
 
-    def shrink(self, possibility) -> None:
+    def shrink(self, choice) -> None:
         """If we have found an interesting example, try shrinking it
         so that the choice sequence leading to our best example is
         shortlex smaller than the one we originally found. This improves
@@ -445,7 +300,7 @@ class TestingState(object):
             test_case = TestData.for_choices(choices)
 
             try:
-                data = test_case.any(possibility)
+                data = choice(test_case)
                 r = self.__test_function(data)
                 if not r:
                     test_case.mark_status(Status.INTERESTING)
